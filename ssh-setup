@@ -1,0 +1,108 @@
+#!/bin/bash
+set -euo pipefail
+
+# === CONFIGURATION ===
+USERNAME="sshuser"
+SSH_PORT="1986"
+PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFS8hxp6eg2wmX/IRpH6Cc6h1+yA7zb4lMO26+kAmxFo Nitro@DESKTOP-AMAVCJD"
+SSH_CONFIG="/etc/ssh/sshd_config"
+
+# === ROOT PRIVILEGE CHECK ===
+if [[ $EUID -ne 0 ]]; then
+    echo "This script requires root privileges. Run with: sudo $0"
+    exit 1
+fi
+
+echo "Starting SSH setup..."
+
+# === 1. Install openssh-server ===
+echo "[1/7] Installing openssh-server..."
+apt update -y >/dev/null 2>&1
+apt install -y openssh-server >/dev/null 2>&1 && echo "OpenSSH installed" || {
+    echo "Failed to install openssh-server"
+    exit 1
+}
+
+# === 2. Create user (if not exists) ===
+echo "[2/7] Creating user $USERNAME..."
+if id "$USERNAME" &>/dev/null; then
+    echo "User $USERNAME already exists, skipping creation"
+else
+    useradd -m -s /bin/bash -G sudo "$USERNAME" && \
+    echo "User $USERNAME created with sudo privileges" || {
+        echo "Failed to create user"
+        exit 1
+    }
+fi
+
+# === 3. Configure SSH key ===
+echo "[3/7] Configuring SSH key for $USERNAME..."
+USER_HOME="/home/$USERNAME"
+SSH_DIR="$USER_HOME/.ssh"
+AUTH_KEYS="$SSH_DIR/authorized_keys"
+
+mkdir -p "$SSH_DIR"
+echo "$PUBLIC_KEY" > "$AUTH_KEYS"
+chown -R "$USERNAME:$USERNAME" "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+chmod 600 "$AUTH_KEYS"
+echo "SSH key configured"
+
+# === 4. Backup SSH config ===
+echo "[4/7] Creating backup of $SSH_CONFIG -> ${SSH_CONFIG}.bak"
+cp "$SSH_CONFIG" "${SSH_CONFIG}.bak"
+
+# === 5. Modify SSH configuration ===
+echo "[5/7] Updating SSH configuration..."
+# Use reliable patterns with ^ for line start
+sed -i "s/^#Port 22/Port $SSH_PORT/" "$SSH_CONFIG"
+sed -i "s/^#PermitRootLogin.*/PermitRootLogin no/" "$SSH_CONFIG"
+sed -i "s/^#PubkeyAuthentication.*/PubkeyAuthentication yes/" "$SSH_CONFIG"
+sed -i "s/^PasswordAuthentication.*/PasswordAuthentication no/" "$SSH_CONFIG"
+sed -i "s/^#PasswordAuthentication.*/PasswordAuthentication no/" "$SSH_CONFIG"
+
+# Ensure parameters are set (in case lines weren't commented)
+grep -q "^Port " "$SSH_CONFIG" || echo "Port $SSH_PORT" >> "$SSH_CONFIG"
+grep -q "^PermitRootLogin " "$SSH_CONFIG" || echo "PermitRootLogin no" >> "$SSH_CONFIG"
+grep -q "^PubkeyAuthentication " "$SSH_CONFIG" || echo "PubkeyAuthentication yes" >> "$SSH_CONFIG"
+grep -q "^PasswordAuthentication " "$SSH_CONFIG" || echo "PasswordAuthentication no" >> "$SSH_CONFIG"
+
+echo "Configuration updated:"
+grep -E "^(Port|PermitRootLogin|PubkeyAuthentication|PasswordAuthentication)" "$SSH_CONFIG" | sed 's/^/   /'
+
+# === 6. Validate configuration (CRITICAL!) ===
+echo "[6/7] Validating SSH configuration..."
+if ! sshd -t; then
+    echo "SSH configuration error! Restoring backup..."
+    cp "${SSH_CONFIG}.bak" "$SSH_CONFIG"
+    exit 1
+fi
+echo "Configuration is valid"
+
+# === 7. Restart SSH service ===
+echo "[7/7] Restarting SSH service..."
+systemctl enable ssh --now >/dev/null 2>&1 && \
+systemctl restart ssh >/dev/null 2>&1 && \
+echo "SSH restarted on port $SSH_PORT" || {
+    echo "Failed to restart SSH. Restoring config..."
+    cp "${SSH_CONFIG}.bak" "$SSH_CONFIG"
+    systemctl restart ssh
+    exit 1
+}
+
+# === FINAL VERIFICATION ===
+echo ""
+echo "=========================================="
+echo "SETUP COMPLETED SUCCESSFULLY"
+echo "=========================================="
+echo "• User: $USERNAME (with sudo privileges)"
+echo "• SSH Port: $SSH_PORT"
+echo "• Authentication: SSH key only"
+echo "• Root login: disabled"
+echo ""
+echo "IMPORTANT: Test connection in a NEW terminal window BEFORE closing current session:"
+echo "   ssh -p $SSH_PORT $USERNAME@$(hostname -I | awk '{print $1}')"
+echo ""
+echo "If you lose access, restore config from backup:"
+echo "   sudo cp ${SSH_CONFIG}.bak $SSH_CONFIG && sudo systemctl restart ssh"
+echo "=========================================="
